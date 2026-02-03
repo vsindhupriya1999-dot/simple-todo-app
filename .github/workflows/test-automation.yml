@@ -99,12 +99,6 @@ jobs:
       
       - name: Install Playwright Browsers
         run: npx playwright install --with-deps
-      
-      - name: Start TODO App Server
-        run: npm start &
-        
-      - name: Wait for server to be ready
-        run: npx wait-on http://localhost:3013 --timeout 60000 || npm start &
         
       - name: Run E2E Tests
         run: npm run test:e2e

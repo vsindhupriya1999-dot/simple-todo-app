@@ -62,7 +62,7 @@ import { check, sleep } from 'k6';
  */
 
 // Configuration
-const BASE_URL = __ENV.BASE_URL || 'http://localhost:3000';
+const BASE_URL = __ENV.BASE_URL || 'http://127.0.0.1:3013';
 
 // k6 test options
 export const options = {
@@ -101,7 +101,7 @@ export function setup() {
 
   check(healthRes, {
     'setup: API is reachable': (r) => r.status === 200,
-    'setup: response is JSON': (r) => r.headers['Content-Type'].includes('application/json'),
+    'setup: response is JSON': (r) => r.headers['Content-Type'] && r.headers['Content-Type'].includes('application/json'),
   });
 
   if (healthRes.status !== 200) {

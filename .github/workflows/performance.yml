@@ -1,0 +1,496 @@
+name: Performance Tests (k6)
+
+on:
+  # Run smoke test on every PR
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'tests/performance/**'
+      - 'package.json'
+      - '.github/workflows/performance.yml'
+
+  # Run nightly baseline + load tests
+  schedule:
+    # 2 AM UTC (adjust to your timezone if needed)
+    - cron: '0 2 * * *'
+
+  # Manual trigger with test type selection
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Select performance test type'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - baseline
+          - load
+          - stress
+          - soak
+      duration:
+        description: 'Override duration (e.g., 30m for soak)'
+        required: false
+        type: string
+
+concurrency:
+  # Ensure only one performance test runs per branch at a time
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # Security Guard: Prevent accidental runs against production
+  # ============================================================================
+  guard:
+    name: 🛡️ Prod Guard Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify BASE_URL is not production
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+        run: |
+          if [[ -z "$BASE_URL" ]]; then
+            echo "❌ ERROR: STAGING_BASE_URL secret is not configured"
+            echo "Please add STAGING_BASE_URL to GitHub Secrets"
+            exit 1
+          fi
+
+          # Block if URL contains production indicators
+          if [[ "$BASE_URL" =~ "prod" || "$BASE_URL" =~ "production" ]]; then
+            echo "❌ SECURITY: BASE_URL appears to be production!"
+            echo "BASE_URL: $BASE_URL"
+            echo "Performance tests must run on staging/pre-prod only"
+            exit 1
+          fi
+
+          if [[ "$BASE_URL" =~ ^https?://localhost || "$BASE_URL" =~ ^https?://127.0.0.1 ]]; then
+            echo "✅ Local environment detected: $BASE_URL"
+          elif [[ "$BASE_URL" =~ staging || "$BASE_URL" =~ test || "$BASE_URL" =~ pre-release ]]; then
+            echo "✅ Staging environment detected: $BASE_URL"
+          else
+            echo "⚠️  WARNING: BASE_URL is not recognized as staging: $BASE_URL"
+            echo "Proceeding with caution..."
+          fi
+
+  # ============================================================================
+  # SMOKE TEST: Run on every PR (quick validation)
+  # ============================================================================
+  smoke-test:
+    name: 🔥 Smoke Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'smoke')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Start API Server
+        run: |
+          npm ci
+          npm start &
+          # Wait for server to be ready
+          sleep 3
+          for i in {1..30}; do
+            if curl -s http://localhost:3000/api/about > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ API server failed to start"
+              exit 1
+            fi
+            echo "Waiting for API server... ($i/30)"
+            sleep 1
+          done
+
+      - name: Run Smoke Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3000' }}
+          K6_VUS: 5
+          K6_DURATION: 60s
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --vus 5 \
+            --duration 60s \
+            --out json=test-results/smoke-results.json \
+            tests/performance/perf-smoke.test.js \
+            2>&1 | tee test-results/smoke.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          echo "## 🔥 Smoke Test Results" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f test-results/smoke-results.json ]; then
+            # Extract key metrics from JSON
+            P95=$(jq '.metrics.http_req_duration.values.p95 // 0' test-results/smoke-results.json 2>/dev/null | head -1)
+            P99=$(jq '.metrics.http_req_duration.values.p99 // 0' test-results/smoke-results.json 2>/dev/null | head -1)
+            ERROR_RATE=$(jq '.metrics.http_req_failed.values.rate // 0' test-results/smoke-results.json 2>/dev/null | head -1)
+            
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| P95 Latency | ${P95}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| P99 Latency | ${P99}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Duration | 60 seconds |" >> $GITHUB_STEP_SUMMARY
+            echo "| VUs | 5 |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Results file not found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results
+          path: test-results/
+          retention-days: 30
+
+      - name: Check Thresholds
+        if: always()
+        run: |
+          if grep -q "THRESHOLD SUMMARY" test-results/smoke.log; then
+            if grep -q "exceeded" test-results/smoke.log; then
+              echo "⚠️ Some thresholds were exceeded"
+              exit 1
+            fi
+          fi
+
+  # ============================================================================
+  # BASELINE TEST: Run nightly (reference for trend comparison)
+  # ============================================================================
+  baseline-test:
+    name: 📊 Baseline Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'baseline')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Start API Server
+        run: |
+          npm ci
+          npm start &
+          sleep 3
+          for i in {1..30}; do
+            if curl -s http://localhost:3000/api/about > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ API server failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run Baseline Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3000' }}
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --out json=test-results/baseline-results.json \
+            tests/performance/baseline.test.js \
+            2>&1 | tee test-results/baseline.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          echo "## 📊 Baseline Test Results" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f test-results/baseline-results.json ]; then
+            P95=$(jq '.metrics.http_req_duration.values.p95 // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+            P99=$(jq '.metrics.http_req_duration.values.p99 // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+            ERROR_RATE=$(jq '.metrics.http_req_failed.values.rate // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+            THROUGHPUT=$(jq '.metrics.http_reqs.values.rate // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+            
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| P95 Latency | ${P95}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| P99 Latency | ${P99}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Throughput | ${THROUGHPUT} req/s |" >> $GITHUB_STEP_SUMMARY
+            echo "| Duration | 120 seconds |" >> $GITHUB_STEP_SUMMARY
+            echo "| VUs | 5-10 |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-test-results
+          path: test-results/
+          retention-days: 30
+
+  # ============================================================================
+  # LOAD TEST: Run nightly (sustained realistic load)
+  # ============================================================================
+  load-test:
+    name: 📈 Load Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'load')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Start API Server
+        run: |
+          npm ci
+          npm start &
+          sleep 3
+          for i in {1..30}; do
+            if curl -s http://localhost:3000/api/about > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ API server failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run Load Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3000' }}
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --out json=test-results/load-results.json \
+            tests/performance/load.test.js \
+            2>&1 | tee test-results/load.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          echo "## 📈 Load Test Results" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f test-results/load-results.json ]; then
+            P95=$(jq '.metrics.http_req_duration.values.p95 // 0' test-results/load-results.json 2>/dev/null | head -1)
+            P99=$(jq '.metrics.http_req_duration.values.p99 // 0' test-results/load-results.json 2>/dev/null | head -1)
+            ERROR_RATE=$(jq '.metrics.http_req_failed.values.rate // 0' test-results/load-results.json 2>/dev/null | head -1)
+            THROUGHPUT=$(jq '.metrics.http_reqs.values.rate // 0' test-results/load-results.json 2>/dev/null | head -1)
+            
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| P95 Latency | ${P95}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| P99 Latency | ${P99}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Throughput | ${THROUGHPUT} req/s |" >> $GITHUB_STEP_SUMMARY
+            echo "| Duration | 480 seconds (8 min) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Peak VUs | 40 |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results
+          path: test-results/
+          retention-days: 30
+
+  # ============================================================================
+  # STRESS TEST: Manual trigger only (pushes API to breaking point)
+  # ============================================================================
+  stress-test:
+    name: ⚡ Stress Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'stress'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Start API Server
+        run: |
+          npm ci
+          npm start &
+          sleep 3
+          for i in {1..30}; do
+            if curl -s http://localhost:3000/api/about > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ API server failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run Stress Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3000' }}
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --out json=test-results/stress-results.json \
+            tests/performance/stress.test.js \
+            2>&1 | tee test-results/stress.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          echo "## ⚡ Stress Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Objective: Identify safe capacity and breaking point" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f test-results/stress-results.json ]; then
+            P95=$(jq '.metrics.http_req_duration.values.p95 // 0' test-results/stress-results.json 2>/dev/null | head -1)
+            P99=$(jq '.metrics.http_req_duration.values.p99 // 0' test-results/stress-results.json 2>/dev/null | head -1)
+            ERROR_RATE=$(jq '.metrics.http_req_failed.values.rate // 0' test-results/stress-results.json 2>/dev/null | head -1)
+            
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| P95 Latency | ${P95}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| P99 Latency | ${P99}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Max VUs | 100 |" >> $GITHUB_STEP_SUMMARY
+            echo "| Stages | 7 (10→100 VUs) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Review breakdown point where error rate > 5% or p99 > 3000ms**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-results
+          path: test-results/
+          retention-days: 30
+
+  # ============================================================================
+  # SOAK TEST: Manual trigger only (long-duration stability test)
+  # ============================================================================
+  soak-test:
+    name: 🧪 Soak Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'soak'
+    timeout-minutes: 90  # 60min soak + buffer
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6-stable.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Start API Server
+        run: |
+          npm ci
+          npm start &
+          sleep 3
+          for i in {1..30}; do
+            if curl -s http://localhost:3000/api/about > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "❌ API server failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run Soak Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3000' }}
+          SOAK_DURATION: ${{ github.event.inputs.duration || '30m' }}
+        run: |
+          mkdir -p test-results
+          echo "Starting soak test with duration: $SOAK_DURATION"
+          k6 run \
+            --out json=test-results/soak-results.json \
+            tests/performance/soak.test.js \
+            2>&1 | tee test-results/soak.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          echo "## 🧪 Soak Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Objective: Detect memory leaks, latency creep, error accumulation" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f test-results/soak-results.json ]; then
+            P95=$(jq '.metrics.http_req_duration.values.p95 // 0' test-results/soak-results.json 2>/dev/null | head -1)
+            P99=$(jq '.metrics.http_req_duration.values.p99 // 0' test-results/soak-results.json 2>/dev/null | head -1)
+            ERROR_RATE=$(jq '.metrics.http_req_failed.values.rate // 0' test-results/soak-results.json 2>/dev/null | head -1)
+            
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| P95 Latency | ${P95}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| P99 Latency | ${P99}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Duration | $SOAK_DURATION |" >> $GITHUB_STEP_SUMMARY
+            echo "| Constant VUs | 10 |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Monitor for: memory growth > 20% per hour, latency increase, error drift**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-test-results
+          path: test-results/
+          retention-days: 30
+
+  # ============================================================================
+  # FINAL: Notify and summarize all results
+  # ============================================================================
+  summary:
+    name: 📋 Test Summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [guard]
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## ✅ Performance Test Workflow Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Triggered by: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Results:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Check artifacts for detailed logs and JSON results" >> $GITHUB_STEP_SUMMARY
+          echo "- All tests run with concurrency control (one per branch)" >> $GITHUB_STEP_SUMMARY
+          echo "- Prod guard verified before test execution" >> $GITHUB_STEP_SUMMARY

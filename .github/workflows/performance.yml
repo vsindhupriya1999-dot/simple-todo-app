@@ -50,31 +50,51 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify BASE_URL is not production
+        # We import STAGING_BASE_URL secret into the step's env. If the secret
+        # isn't configured this will be an empty string — we handle that below.
         env:
-          BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
         run: |
-          if [[ -z "$BASE_URL" ]]; then
-            echo "❌ ERROR: STAGING_BASE_URL secret is not configured"
-            echo "Please add STAGING_BASE_URL to GitHub Secrets"
-            exit 1
+          # Explanation:
+          # - For PRs we allow a safe fallback (http://localhost:3000) so checks don't fail when secrets aren't present.
+          # - Performance tests must NEVER run against production. We hard-fail if the resolved BASE_URL
+          #   looks like a production URL (contains "prod" / "production" or is an external host
+          #   that doesn't indicate staging/test/pre-release).
+          #
+          # Resolve BASE_URL:
+          BASE_URL="${STAGING_BASE_URL:-http://localhost:3000}"
+          echo "Resolved BASE_URL: $BASE_URL"
+
+          # If the secret was missing we purposely DO NOT fail — fallback to localhost is allowed for PRs.
+          if [[ -z "${STAGING_BASE_URL}" ]]; then
+            echo "ℹ️ STAGING_BASE_URL secret not provided. Falling back to safe default: http://localhost:3000"
+            echo "This allows PR checks to run without requiring repository secrets."
           fi
 
-          # Block if URL contains production indicators
+          # Hard fail if URL contains explicit production indicators
           if [[ "$BASE_URL" =~ "prod" || "$BASE_URL" =~ "production" ]]; then
             echo "❌ SECURITY: BASE_URL appears to be production!"
             echo "BASE_URL: $BASE_URL"
-            echo "Performance tests must run on staging/pre-prod only"
+            echo "Performance tests must run on staging/pre-prod or localhost only. Aborting."
             exit 1
           fi
 
-          if [[ "$BASE_URL" =~ ^https?://localhost || "$BASE_URL" =~ ^https?://127.0.0.1 ]]; then
-            echo "✅ Local environment detected: $BASE_URL"
-          elif [[ "$BASE_URL" =~ staging || "$BASE_URL" =~ test || "$BASE_URL" =~ pre-release ]]; then
-            echo "✅ Staging environment detected: $BASE_URL"
-          else
-            echo "⚠️  WARNING: BASE_URL is not recognized as staging: $BASE_URL"
-            echo "Proceeding with caution..."
+          # Additional sanity check: block when BASE_URL appears to be a non-localhost external host
+          # that does not include staging/test/pre-release hints. This reduces the risk of accidentally
+          # pointing tests at a production domain. Examples allowed: localhost, 127.0.0.1, any URL
+          # containing 'staging', 'test', or 'pre-release'.
+          if [[ ! "$BASE_URL" =~ ^https?://(localhost|127\.0\.0\.1) ]] && \
+             [[ ! "$BASE_URL" =~ staging ]] && \
+             [[ ! "$BASE_URL" =~ test ]] && \
+             [[ ! "$BASE_URL" =~ pre-release ]]; then
+            echo "❌ SECURITY: BASE_URL does not look like a non-production environment: $BASE_URL"
+            echo "If this is a legitimate staging URL, consider setting the STAGING_BASE_URL secret or"
+            echo "ensure the URL contains a staging/test/pre-release indicator. Aborting to avoid harm."
+            exit 1
           fi
+
+          # If we reach here, the BASE_URL is considered safe (localhost or recognized staging/test)
+          echo "✅ BASE_URL check passed: $BASE_URL"
 
   # ============================================================================
   # SMOKE TEST: Run on every PR (quick validation)

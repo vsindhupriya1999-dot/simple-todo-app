@@ -7,7 +7,6 @@ on:
     - cron: '0 2 * * *' # nightly at 02:00 UTC
   workflow_dispatch: {}
 
-# Needed so GITHUB_TOKEN can read repo + (optionally) comment on PRs
 permissions:
   contents: read
   pull-requests: write
@@ -17,6 +16,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,8 +28,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
-          # Optional: if you don't want PR comments
-          # GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Upload Gitleaks SARIF
+        if: always() && hashFiles('results.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: results.sarif
 
       - name: Run Semgrep
         uses: returntocorp/semgrep-action@v1
@@ -63,6 +68,7 @@ jobs:
     strategy:
       matrix:
         node: [18]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,6 +94,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -106,6 +113,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -163,10 +171,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
-          # Optional: disable PR comments in nightly
-          # GITLEAKS_ENABLE_COMMENTS: "false"
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nightly-artifacts

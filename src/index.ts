@@ -339,16 +339,7 @@ app.get('/api/about', (req, res) => {
 app.post('/api/todos/generate', (req, res) => {
   logDebug('Generating todos with params:', req.body);
 
-  // Validate request
-  const validation = TodoGeneratorService.validateRequest(req.body);
-  if (!validation.valid) {
-    return res.status(400).json({
-      success: false,
-      message: validation.error,
-    });
-  }
-
-  // Generate todos using the service
+  // Generate todos using the service (which handles validation internally)
   const nextIdRef = { value: nextId };
   const result = TodoGeneratorService.generateTodos(req.body, nextIdRef, todos);
 

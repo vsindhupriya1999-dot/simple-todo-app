@@ -1,0 +1,292 @@
+name: Performance Tests (k6)
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'tests/performance/**'
+      - 'package.json'
+      - '.github/workflows/performance.yml'
+
+  schedule:
+    - cron: '0 2 * * *'
+
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Select performance test type'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - baseline
+          - load
+          - stress
+          - soak
+      duration:
+        description: 'Override duration (e.g., 30m for soak)'
+        required: false
+        type: string
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # Security Guard: Prevent accidental runs against production
+  # ============================================================================
+  guard:
+    name: 🛡️ Prod Guard Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify BASE_URL is not production
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+        run: |
+          BASE_URL="${STAGING_BASE_URL:-http://localhost:3013}"
+          echo "Resolved BASE_URL: $BASE_URL"
+
+          if [[ -z "${STAGING_BASE_URL}" ]]; then
+            echo "ℹ️ STAGING_BASE_URL secret not provided. Falling back to safe default: http://localhost:3013"
+          fi
+
+          if [[ "$BASE_URL" =~ "prod" || "$BASE_URL" =~ "production" ]]; then
+            echo "❌ SECURITY: BASE_URL appears to be production!"
+            echo "BASE_URL: $BASE_URL"
+            exit 1
+          fi
+
+          if [[ ! "$BASE_URL" =~ ^https?://(localhost|127\.0\.0\.1) ]] && \
+             [[ ! "$BASE_URL" =~ staging ]] && \
+             [[ ! "$BASE_URL" =~ test ]] && \
+             [[ ! "$BASE_URL" =~ pre-release ]]; then
+            echo "❌ SECURITY: BASE_URL does not look like a non-production environment: $BASE_URL"
+            exit 1
+          fi
+
+          echo "✅ BASE_URL check passed: $BASE_URL"
+
+  # ============================================================================
+  # SMOKE TEST: Run on every PR (quick validation)
+  # ============================================================================
+  smoke-test:
+    name: 🔥 Smoke Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'smoke')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Install jq (for summaries)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start API Server
+        env:
+          PORT: 3013
+        run: |
+          npm ci
+          npm start &
+
+          echo "Waiting for API server on port $PORT..."
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:${PORT}/api/about" > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 60 ]; then
+              echo "❌ API server failed to become ready"
+              exit 1
+            fi
+            echo "Waiting for API server... ($i/60)"
+            sleep 1
+          done
+
+      - name: Run Smoke Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3013' }}
+          K6_VUS: 5
+          K6_DURATION: 60s
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --vus 5 \
+            --duration 60s \
+            --out json=test-results/smoke-results.json \
+            tests/performance/perf-smoke.test.js \
+            2>&1 | tee test-results/smoke.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          echo "## 🔥 Smoke Test Results" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f test-results/smoke-results.json ]; then
+            P95=$(jq '.metrics.http_req_duration.values.p95 // 0' test-results/smoke-results.json 2>/dev/null | head -1)
+            P99=$(jq '.metrics.http_req_duration.values.p99 // 0' test-results/smoke-results.json 2>/dev/null | head -1)
+            ERROR_RATE=$(jq '.metrics.http_req_failed.values.rate // 0' test-results/smoke-results.json 2>/dev/null | head -1)
+
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| P95 Latency | ${P95}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| P99 Latency | ${P99}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Duration | 60 seconds |" >> $GITHUB_STEP_SUMMARY
+            echo "| VUs | 5 |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Results file not found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results
+          path: test-results/
+          retention-days: 30
+
+      - name: Check Thresholds
+        if: always()
+        run: |
+          if grep -q "THRESHOLD SUMMARY" test-results/smoke.log; then
+            if grep -q "exceeded" test-results/smoke.log; then
+              echo "⚠️ Some thresholds were exceeded"
+              exit 1
+            fi
+          fi
+
+  # ============================================================================
+  # BASELINE TEST: Run nightly (reference for trend comparison)
+  # ============================================================================
+  baseline-test:
+    name: 📊 Baseline Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'baseline')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Install jq (for summaries)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start API Server
+        env:
+          PORT: 3013
+        run: |
+          npm ci
+          npm start &
+
+          echo "Waiting for API server on port $PORT..."
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:${PORT}/api/about" > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 60 ]; then
+              echo "❌ API server failed to become ready"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run Baseline Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3013' }}
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --out json=test-results/baseline-results.json \
+            tests/performance/baseline.test.js \
+            2>&1 | tee test-results/baseline.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          echo "## 📊 Baseline Test Results" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f test-results/baseline-results.json ]; then
+            P95=$(jq '.metrics.http_req_duration.values.p95 // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+            P99=$(jq '.metrics.http_req_duration.values.p99 // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+            ERROR_RATE=$(jq '.metrics.http_req_failed.values.rate // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+            THROUGHPUT=$(jq '.metrics.http_reqs.values.rate // 0' test-results/baseline-results.json 2>/dev/null | head -1)
+
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| P95 Latency | ${P95}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| P99 Latency | ${P99}ms |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Throughput | ${THROUGHPUT} req/s |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-test-results
+          path: test-results/
+          retention-days: 30
+
+  # ============================================================================
+  # LOAD TEST: Run nightly (sustained realistic load)
+  # ============================================================================
+  load-test:
+    name: 📈 Load Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'load')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Install jq (for summaries)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start API Server
+        env:
+          PORT: 3013
+        run: |
+          npm ci
+          npm start &
+
+          echo "Waiting for API server on port $PORT..."
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:${PORT}/api/about" > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 60 ]; then
+              echo "❌ API server failed to become ready"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run Load Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3013' }}
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --out json=test-results/load-results.json \
+            tests/performance/load.test.js \
+            2>&1 | tee test-results/load.log
+
+      - name: Parse and Print Results Summary
+        if: always()
+        run: |
+          ech

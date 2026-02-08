@@ -1,0 +1,161 @@
+name: CI - Security and Tests
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 2 * * *' # nightly at 02:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  security-scans:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Gitleaks (diff/PR mode)
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: --path=. --commit-range=origin/${{ github.base_ref }}...${{ github.sha }} --config=.gitleaks.toml
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: ".semgrep.yml"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: npm audit (fail on high/critical)
+        run: |
+          npm audit --audit-level=high || (echo "High/Critical vulnerability found" && exit 1)
+
+      - name: Upload security summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: |
+            .gitleaks.toml
+            .semgrep.yml
+
+  unit-and-smoke-tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        node: [18]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Run unit tests
+        run: npm run test:unit --silent
+
+      - name: Run API smoke tests (in-memory)
+        run: npm run test:api-smoke --silent
+
+  static-analysis:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Type check
+        run: npx tsc --noEmit
+
+  nightly-full-security-and-tests:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start server (background, bind to loopback only)
+        run: |
+          nohup npm start &>/tmp/server.log &
+          echo "Waiting for server..."
+          for i in {1..30}; do
+            if curl -sSf http://127.0.0.1:3013/api/help >/dev/null; then
+              echo "server ready" && break
+            fi
+            sleep 1
+          done
+
+      - name: Run full API tests
+        run: npm run test:api --silent
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run E2E tests (Playwright)
+        run: npm run test:e2e --silent
+
+      - name: OWASP ZAP baseline + limited active scan
+        run: |
+          docker run -u zap -d --name zap -p 8090:8090 owasp/zap2docker-stable zap.sh -daemon -port 8090 -host 127.0.0.1
+          # Wait for ZAP to be available
+          for i in {1..30}; do
+            if curl -sSf http://127.0.0.1:8090 >/dev/null; then break; fi
+            sleep 1
+          done
+          # Baseline passive scan
+          docker run --rm --network host owasp/zap2docker-stable zap-baseline.py -t http://127.0.0.1:3013 -r zap-report.html -I -S -d
+          # Active scan (limited) with max duration 5 minutes
+          docker run --rm --network host owasp/zap2docker-stable zap-full-scan.py -t http://127.0.0.1:3013 -r zap-active-report.html -d -T 300
+
+      - name: npm audit (full)
+        run: npm audit --json > audit-report.json || true
+
+      - name: Semgrep full scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: ".semgrep.yml"
+
+      - name: Gitleaks full repo scan
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: --path=. --config=.gitleaks.toml
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-artifacts
+          path: |
+            zap-report.html
+            zap-active-report.html
+            audit-report.json
+            semgrep-report.json || true
+
+      - name: Teardown server
+        run: |
+          pkill -f "tsx src/index.ts" || true
+          docker ps -q --filter "name=zap" | xargs -r docker stop || true

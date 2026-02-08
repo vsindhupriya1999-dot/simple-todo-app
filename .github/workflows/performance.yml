@@ -290,3 +290,121 @@ jobs:
         if: always()
         run: |
           ech
+
+  # ============================================================================
+  # STRESS TEST: Manual trigger only (pushes API toward breaking point)
+  # ============================================================================
+  stress-test:
+    name: ⚡ Stress Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'stress'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Install jq (for summaries)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start API Server
+        env:
+          PORT: 3013
+        run: |
+          npm ci
+          npm start &
+
+          echo "Waiting for API server on port $PORT..."
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:${PORT}/api/about" > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 60 ]; then
+              echo "❌ API server failed to become ready"
+              exit 1
+            fi
+            echo "Waiting for API server... ($i/60)"
+            sleep 1
+          done
+
+      - name: Run Stress Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3013' }}
+        run: |
+          mkdir -p test-results
+          k6 run \
+            --out json=test-results/stress-results.json \
+            tests/performance/stress.test.js \
+            2>&1 | tee test-results/stress.log
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-results
+          path: test-results/
+          retention-days: 30
+
+  # ============================================================================
+  # SOAK TEST: Manual trigger only (long-duration stability test)
+  # ============================================================================
+  soak-test:
+    name: 🧪 Soak Test
+    needs: guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_type == 'soak'
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Install jq (for summaries)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start API Server
+        env:
+          PORT: 3013
+        run: |
+          npm ci
+          npm start &
+
+          echo "Waiting for API server on port $PORT..."
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:${PORT}/api/about" > /dev/null; then
+              echo "✅ API server is ready"
+              break
+            fi
+            if [ $i -eq 60 ]; then
+              echo "❌ API server failed to become ready"
+              exit 1
+            fi
+            echo "Waiting for API server... ($i/60)"
+            sleep 1
+          done
+
+      - name: Run Soak Test
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'http://localhost:3013' }}
+          SOAK_DURATION: ${{ github.event.inputs.duration || '30m' }}
+        run: |
+          mkdir -p test-results
+          echo "Starting soak test with duration: $SOAK_DURATION"
+          k6 run \
+            --duration "$SOAK_DURATION" \
+            --out json=test-results/soak-results.json \
+            tests/performance/soak.test.js \
+            2>&1 | tee test-results/soak.log
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-test-results
+          path: test-results/
+          retention-days: 30

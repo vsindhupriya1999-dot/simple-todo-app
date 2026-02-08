@@ -7,6 +7,11 @@ on:
     - cron: '0 2 * * *' # nightly at 02:00 UTC
   workflow_dispatch: {}
 
+# Needed so GITHUB_TOKEN can read repo + (optionally) comment on PRs
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   security-scans:
     if: github.event_name == 'pull_request'
@@ -15,11 +20,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Run Gitleaks (diff/PR mode)
-        uses: zricethezav/gitleaks-action@v2
         with:
-          args: --path=. --commit-range=origin/${{ github.base_ref }}...${{ github.sha }} --config=.gitleaks.toml
+          fetch-depth: 0
+
+      - name: Run Gitleaks (PR scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Optional: if you don't want PR comments
+          # GITLEAKS_ENABLE_COMMENTS: "false"
 
       - name: Run Semgrep
         uses: returntocorp/semgrep-action@v1
@@ -80,6 +90,15 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -90,6 +109,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -122,14 +143,11 @@ jobs:
       - name: OWASP ZAP baseline + limited active scan
         run: |
           docker run -u zap -d --name zap -p 8090:8090 owasp/zap2docker-stable zap.sh -daemon -port 8090 -host 127.0.0.1
-          # Wait for ZAP to be available
           for i in {1..30}; do
             if curl -sSf http://127.0.0.1:8090 >/dev/null; then break; fi
             sleep 1
           done
-          # Baseline passive scan
           docker run --rm --network host owasp/zap2docker-stable zap-baseline.py -t http://127.0.0.1:3013 -r zap-report.html -I -S -d
-          # Active scan (limited) with max duration 5 minutes
           docker run --rm --network host owasp/zap2docker-stable zap-full-scan.py -t http://127.0.0.1:3013 -r zap-active-report.html -d -T 300
 
       - name: npm audit (full)
@@ -141,9 +159,12 @@ jobs:
           config: ".semgrep.yml"
 
       - name: Gitleaks full repo scan
-        uses: zricethezav/gitleaks-action@v2
-        with:
-          args: --path=. --config=.gitleaks.toml
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Optional: disable PR comments in nightly
+          # GITLEAKS_ENABLE_COMMENTS: "false"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -153,9 +174,10 @@ jobs:
             zap-report.html
             zap-active-report.html
             audit-report.json
-            semgrep-report.json || true
+            /tmp/server.log
 
       - name: Teardown server
+        if: always()
         run: |
-          pkill -f "tsx src/index.ts" || true
+          pkill -f "npm start" || true
           docker ps -q --filter "name=zap" | xargs -r docker stop || true

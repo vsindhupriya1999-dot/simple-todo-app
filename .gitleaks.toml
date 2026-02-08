@@ -1,22 +1,23 @@
-# Gitleaks configuration tuned for this repository
-# This config enables diff/PR scanning and has an allowlist for README files
+title = "Gitleaks config for simple-todo-app"
 
-[rules]
-  [[rules.rules]]
-  id = "generic-api-key"
-  description = "Generic API key or secret in code"
-  regex = '''(?i)(api[_-]?key|secret|token)["' ]?[:=\s]{1,}['\"]?[0-9A-Za-z\-\._]{8,}['\"]?'''
+# NOTE:
+# Rules must be top-level [[rules]] blocks (NOT [rules] + [[rules.rules]])
 
-  [[rules.rules]]
-  id = "aws-access-key"
-  description = "AWS Access Key ID"
-  regex = '''AKIA[0-9A-Z]{16}'''
+[[rules]]
+id = "generic-api-key"
+description = "Generic API key / secret / token patterns"
+regex = '''(?i)(api[_-]?key|secret|token)["' ]?[:=\s]{1,}['"]?[0-9A-Za-z\-\._]{8,}['"]?'''
+tags = ["key", "secret"]
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS Access Key ID"
+regex = '''AKIA[0-9A-Z]{16}'''
+tags = ["aws", "key"]
 
 [allowlist]
-# Allowlist README files and course materials that contain example tokens or docs
-  paths = [
-    "README.MD",
-    "README_TESTING.md"
-  ]
-
-# Fail on any match outside the allowlist
+description = "Allow example tokens inside README docs only"
+paths = [
+  '''README\.md''',
+  '''README_TESTING\.md'''
+]

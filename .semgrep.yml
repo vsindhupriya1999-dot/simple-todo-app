@@ -1,0 +1,27 @@
+rules:
+  - id: nodejs-insecure-eval
+    message: Avoid usage of eval or similar in Node.js
+    severity: ERROR
+    patterns:
+      - pattern: eval($X)
+
+  - id: nodejs-hardcoded-secret
+    message: Hard-coded secret or API key
+    severity: ERROR
+    patterns:
+      - pattern-regex: ((api[_-]?key|secret|token)["' ]?[:=\s]{1,}['"][0-9A-Za-z\-\._]{6,}['"]) 
+
+  - id: express-unsanitized-input
+    message: Unsanitized request input used in sensitive sink
+    severity: WARNING
+    patterns:
+      - pattern: $REQ = req.body
+      - pattern-either:
+          - pattern: exec($REQ)
+          - pattern: query($REQ)
+
+  - id: nodejs-constructive-typescript
+    message: TypeScript check recommended in CI
+    severity: INFO
+    patterns:
+      - pattern: import $X from "$Y"

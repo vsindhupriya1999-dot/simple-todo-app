@@ -1,0 +1,22 @@
+title = "Gitleaks config for simple-todo-app"
+
+# Rules must be top-level [[rules]] blocks
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API key / secret / token patterns"
+regex = '''(?i)(api[_-]?key|secret|token)["' ]?[:=\s]{1,}['"][0-9A-Za-z\-\._]{12,}['"]'''
+tags = ["key", "secret"]
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS Access Key ID"
+regex = '''AKIA[0-9A-Z]{16}'''
+tags = ["aws", "key"]
+
+[allowlist]
+description = "Allow example tokens inside README docs only"
+paths = [
+  '''(?i)README\.md''',
+  '''(?i)README_TESTING\.md'''
+]
